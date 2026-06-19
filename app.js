@@ -1124,9 +1124,20 @@ function periodOptions() {
     const month = s(t.Month), week = s(t.Week);
     if (!month && !week) return;
     const key = month + "|" + week;
-    if (!seen.has(key)) seen.set(key, { value: key, label: (month ? month + " \u2013 " : "") + week, wn: parseInt((week.match(/\d+/) || ["0"])[0], 10) });
+    if (!seen.has(key)) seen.set(key, { value: key, label: (month ? month + " \u2013 " : "") + week, wn: parseInt((week.match(/\d+/) || ["0"])[0], 10), month });
   });
-  return Array.from(seen.values()).sort((a, b) => a.wn - b.wn);
+  const sorted = Array.from(seen.values()).sort((a, b) => a.wn - b.wn);
+  // Interleave a month-summary option before the first week of each month
+  const result = [];
+  const seenMonths = new Set();
+  sorted.forEach((opt) => {
+    if (opt.month && !seenMonths.has(opt.month)) {
+      result.push({ value: "month:" + opt.month, label: opt.month + " \u2014 all weeks" });
+      seenMonths.add(opt.month);
+    }
+    result.push(opt);
+  });
+  return result;
 }
 
 function filterSelectHtml(filterKey, label, options) {
@@ -1138,7 +1149,11 @@ function filterSelectHtml(filterKey, label, options) {
 function filterBarHtml(showKeys) {
   let html = '<div class="filter-bar">';
   if (showKeys.includes("department")) html += filterSelectHtml("department", "Department", uniqueValues(cleanRows("weeklyTasks"), "Department").map((d) => ({ value: d, label: d })));
-  if (showKeys.includes("employee")) html += filterSelectHtml("employee", "Employee", employeeRoster().map((e) => ({ value: e.Employee_ID, label: e.Employee_Name })));
+  if (showKeys.includes("employee")) {
+    const deptFilter = STATE.filters.department;
+    const roster = employeeRoster().filter((e) => deptFilter === "all" || e.Department === deptFilter);
+    html += filterSelectHtml("employee", "Employee", roster.map((e) => ({ value: e.Employee_ID, label: e.Employee_Name })));
+  }
   if (showKeys.includes("companyGoal")) {
     const opts = cleanRows("companyGoals").map((cg) => ({ value: cg.Company_Goal_ID, label: cg.Company_Goal_Title }));
     opts.push({ value: "__unlinked__", label: "Unlinked / broken chain" });
@@ -1161,8 +1176,13 @@ function applyTaskFilters(tasks, keys) {
     else filtered = filtered.filter((t) => t._score.companyGoal && s(t._score.companyGoal.Company_Goal_ID) === f.companyGoal);
   }
   if (keys.includes("period") && f.period !== "all") {
-    const parts = f.period.split("|");
-    filtered = filtered.filter((t) => s(t.Month) === parts[0] && s(t.Week) === parts[1]);
+    if (f.period.startsWith("month:")) {
+      const month = f.period.slice(6);
+      filtered = filtered.filter((t) => s(t.Month) === month);
+    } else {
+      const parts = f.period.split("|");
+      filtered = filtered.filter((t) => s(t.Month) === parts[0] && s(t.Week) === parts[1]);
+    }
   }
   if (keys.includes("riskStatus") && f.riskStatus !== "all") {
     const atRiskSet = new Set(["Misaligned", "Unclear due to insufficient information"]);
@@ -1173,7 +1193,19 @@ function applyTaskFilters(tasks, keys) {
 
 function wireFilterBar(rerenderFn) {
   document.querySelectorAll(".filter-select").forEach((sel) => {
-    sel.addEventListener("change", (e) => { STATE.filters[e.target.getAttribute("data-filter")] = e.target.value; rerenderFn(); });
+    sel.addEventListener("change", (e) => {
+      const key = e.target.getAttribute("data-filter");
+      STATE.filters[key] = e.target.value;
+      // When department changes, clear the employee selection if that employee
+      // isn't in the newly selected department (avoids a stale cross-dept employee filter)
+      if (key === "department" && STATE.filters.employee !== "all") {
+        const emp = employeeRoster().find((em) => em.Employee_ID === STATE.filters.employee);
+        if (!emp || (STATE.filters.department !== "all" && emp.Department !== STATE.filters.department)) {
+          STATE.filters.employee = "all";
+        }
+      }
+      rerenderFn();
+    });
   });
   const resetBtn = document.getElementById("filterResetBtn");
   if (resetBtn) resetBtn.addEventListener("click", () => { STATE.filters = { department: "all", employee: "all", companyGoal: "all", period: "all", riskStatus: "all" }; rerenderFn(); });
