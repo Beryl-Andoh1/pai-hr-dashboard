@@ -1,0 +1,9 @@
+Individual_Goal_ID,Linked_Department_Goal_ID,Employee_ID,Employee_Name,Department,Job_Title,Individual_Goal_Title,KPI,Target,Timeline,Weight
+IG-001,DG-001,EMP-001,Jane Mensah,Sales,Senior Account Manager,Close New Enterprise Accounts,New accounts closed,6 accounts,Q3 2026,40
+IG-002,DG-001,EMP-002,Kojo Owusu,Sales,Account Executive,Grow Existing Account Revenue,Upsell revenue,GHS 800K,Q3 2026,35
+IG-003,DG-002,EMP-003,Ama Boateng,Marketing,Marketing Manager,Increase Marketing-Qualified Leads,MQLs generated,150 MQLs,Q3 2026,30
+IG-004,DG-003,EMP-004,Yaw Asante,Operations,Operations Analyst,Reduce Order Processing Time,Average processing time,2.5 days,Q3 2026,35
+IG-005,DG-004,EMP-005,Linda Adjei,IT,Systems Administrator,Maintain Core System Uptime,Uptime percentage,99.5%,Q3 2026,30
+IG-006,DG-005,EMP-006,Kwame Darko,HR,HR Business Partner,Improve Department Engagement Scores,Engagement score,80%,Q3 2026,30
+IG-007,DG-002,EMP-003,Ama Boateng,Marketing,Marketing Manager,Launch Brand Awareness Campaign,Campaign reach,500K impressions,Q3 2026,25
+IG-008,DG-099,EMP-007,Esi Owusu,Finance,Financial Analyst,Improve Monthly Close Accuracy,Reporting error rate,Less than 1%,Q3 2026,30

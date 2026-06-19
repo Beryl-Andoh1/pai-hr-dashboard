@@ -1,0 +1,7 @@
+Department_Goal_ID,Linked_Company_Goal_ID,Department,Department_Goal_Title,Goal_Description,KPI,Target,Timeline,Goal_Owner
+DG-001,CG-001,Sales,Grow New Business Revenue,Increase new business revenue from target enterprise accounts.,New business revenue,GHS 4.2M,Q3 2026,Head of Sales
+DG-002,CG-001,Marketing,Increase Qualified Pipeline,Generate a higher volume and quality of marketing-sourced leads.,Marketing-qualified leads,600 MQLs,Q3 2026,Head of Marketing
+DG-003,CG-002,Operations,Reduce Process Turnaround Time,Streamline core operational processes to reduce turnaround time.,Average turnaround time,3 days,Q3 2026,Head of Operations
+DG-004,CG-002,IT,Improve System Uptime and Reliability,Reduce downtime and improve reliability of core business systems.,System uptime percentage,99.5% uptime,Q3 2026,Head of IT
+DG-005,CG-003,HR,Improve Employee Engagement,Implement initiatives that improve engagement and retention.,Engagement score,80% engagement,Q3 2026,Head of HR
+DG-006,CG-099,Finance,Improve Financial Reporting Accuracy,Improve the accuracy and timeliness of financial reporting.,Reporting error rate,Less than 1% error rate,Q3 2026,Head of Finance

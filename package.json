@@ -1,0 +1,9 @@
+{
+  "name": "performance-alignment-intelligence",
+  "private": true,
+  "type": "module",
+  "description": "Performance Alignment Intelligence for L'AINE HR — backend functions and static app.",
+  "dependencies": {
+    "@netlify/neon": "^0.1.2"
+  }
+}

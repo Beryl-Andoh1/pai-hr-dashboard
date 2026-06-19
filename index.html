@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Performance Alignment Intelligence — for L'AINE HR</title>
+<meta name="description" content="Performance Alignment Intelligence: analyse whether employee weekly tasks align with individual, departmental, and company goals.">
+
+<!-- PWA -->
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1B3F6E">
+
+<!-- iOS Add-to-Home-Screen support -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="PAI">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ===================== CDN LIBRARIES ===================== -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/gitbrent/pptxgenjs@3.12.0/dist/pptxgen.bundle.js"></script>
+
+<div id="loginScreen" class="login-screen">
+  <form class="login-card" id="loginForm">
+    <div class="brand-mark login-brand-mark">PA</div>
+    <div class="login-title">Performance Alignment Intelligence</div>
+    <div class="login-subtitle">for L'AINE HR &mdash; sign in to continue</div>
+    <label class="login-label" for="loginEmail">Email</label>
+    <input class="login-input" id="loginEmail" name="email" type="email" autocomplete="username" required>
+    <label class="login-label" for="loginPassword">Password</label>
+    <input class="login-input" id="loginPassword" name="password" type="password" autocomplete="current-password" required>
+    <div class="login-error" id="loginError" hidden></div>
+    <button class="btn btn-primary login-submit" id="loginSubmitBtn" type="submit">Sign in</button>
+  </form>
+</div>
+
+<div id="app" hidden>
+
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-brand">
+      <div class="brand-mark">PA</div>
+      <div class="brand-text">
+        <div class="brand-name">Performance Alignment<br>Intelligence</div>
+        <div class="brand-sub">for L'AINE HR</div>
+      </div>
+    </div>
+
+    <nav class="sidebar-nav" id="sidebarNav">
+      <button class="nav-item active" data-section="executive-summary">
+        <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span><span>Executive Summary</span>
+      </button>
+      <button class="nav-item" data-section="upload-centre">
+        <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="M6 9l6-6 6 6"/><path d="M4 20h16"/></svg></span><span>Upload Centre</span>
+      </button>
+      <button class="nav-item" data-section="data-validation">
+        <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l3 3 5-6"/></svg></span><span>Data Validation</span>
+      </button>
+      <button class="nav-item" data-section="goal-mapping">
+        <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 16.5a3.5 3.5 0 010-5l2-2a3.5 3.5 0 015 5l-1 1"/><path d="M16 7.5a3.5 3.5 0 010 5l-2 2a3.5 3.5 0 01-5-5l1-1"/></svg></span><span>Goal Mapping</span>
+      </button>
+      <button class="nav-item" data-section="alignment-analysis">
+        <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="4.2"/><circle cx="12" cy="12" r="0.8" fill="currentColor" stroke="none"/></svg></span><span>Alignment Analysis</span>
+      </button>
+      <button class="nav-item" data-section="employee-reports">
+        <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="8" r="3.2"/><path d="M5 20c0-3.9 3.1-7 7-7s7 3.1 7 7"/></svg></span><span>Employee Reports</span>
+      </button>
+      <button class="nav-item" data-section="department-reports">
+        <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="9" cy="8" r="3"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"/><circle cx="17.5" cy="9" r="2.4"/><path d="M15.5 13.2c2.8.3 5 2.7 5 6.8"/></svg></span><span>Department Reports</span>
+      </button>
+      <button class="nav-item" data-section="organisational-reports">
+        <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="3" width="14" height="18" rx="1"/><path d="M9 8h.01M15 8h.01M9 12h.01M15 12h.01M9 16h.01M15 16h.01"/></svg></span><span>Organisational Reports</span>
+      </button>
+      <button class="nav-item" data-section="trend-over-time">
+        <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19h16"/><path d="M4 19V5"/><path d="M4 14l5-5 4 3 7-8"/></svg></span><span>Trend Over Time</span>
+      </button>
+      <button class="nav-item" data-section="risk-gap-reports">
+        <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5l9 16h-18z"/><path d="M12 9.5v4.2"/><path d="M12 16.8h.01"/></svg></span><span>Risk &amp; Gap Reports</span>
+      </button>
+      <button class="nav-item" data-section="export-centre">
+        <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v12"/><path d="M6 11l6 6 6-6"/><path d="M4 20h16"/></svg></span><span>Export Centre</span>
+      </button>
+      <button class="nav-item" data-section="manage-users" id="manageUsersNavBtn" hidden>
+        <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="9" cy="8" r="3.2"/><path d="M2.5 19.5c0-3.6 2.9-6.5 6.5-6.5s6.5 2.9 6.5 6.5"/><path d="M16.5 4.2a3.2 3.2 0 010 6.2"/><path d="M19 13.3c2 .7 3.5 2.8 3.5 5.2"/></svg></span><span>Manage Users</span>
+      </button>
+    </nav>
+
+    <div class="sidebar-footer">
+      <button class="install-btn" id="installBtn" hidden>
+        <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M12 8v8"/><path d="M8 12h8"/></svg></span> Install App
+      </button>
+      <div class="sidebar-footer-note">WORKFLOW by L'AINE</div>
+    </div>
+  </aside>
+
+  <!-- ===================== MAIN ===================== -->
+  <div class="main">
+    <header class="topbar">
+      <button class="hamburger" id="hamburgerBtn" aria-label="Toggle navigation">☰</button>
+
+      <div class="topbar-steps" id="topbarSteps">
+        <!-- step indicator rendered by JS -->
+      </div>
+
+      <div class="topbar-right">
+        <div class="current-user-chip" id="currentUserChip">
+          <span class="current-user-name" id="currentUserName"></span>
+          <span class="current-user-role" id="currentUserRole"></span>
+        </div>
+        <button class="btn btn-ghost btn-sm" id="logoutBtn">Log out</button>
+        <div class="org-mark">L'AINE</div>
+      </div>
+    </header>
+
+    <main class="content" id="content">
+      <!-- section content rendered by JS -->
+    </main>
+  </div>
+</div>
+
+<div id="toastHost" class="toast-host" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
