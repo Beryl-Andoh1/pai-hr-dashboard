@@ -114,7 +114,8 @@ const STATE = {
   sidebarOpen: false,
   currentUser: null,
   workflowItems: null,     // map "itemType:itemKey" -> {status, assigned_to, comment_count}, null until first loaded
-  snapshotHistory: null    // array from /api/snapshots/history, null until first loaded
+  snapshotHistory: null,    // array from /api/snapshots/history, null until first loaded
+  execFilters: { period: "all", department: "all" }  // independent filters for the Executive Summary
 };
 
 /* ============================== AUTH & API CLIENT ==============================
@@ -1007,6 +1008,34 @@ function computeAtRiskGoalsList() {
   return records;
 }
 
+// KPI compliance: for a given period/dept filter, returns who submitted, who didn't,
+// and counts of not-started and at-risk (delayed/blocked) tasks.
+function computeKPICompliance(periodFilter, deptFilter) {
+  const allTasks = STATE.classifiedTasks || [];
+  let tasks = allTasks;
+  if (deptFilter && deptFilter !== "all") tasks = tasks.filter((t) => s(t.Department) === deptFilter);
+  if (periodFilter && periodFilter !== "all") {
+    if (periodFilter.startsWith("month:")) {
+      const month = periodFilter.slice(6);
+      tasks = tasks.filter((t) => s(t.Month) === month);
+    } else {
+      const parts = periodFilter.split("|");
+      tasks = tasks.filter((t) => s(t.Month) === parts[0] && s(t.Week) === parts[1]);
+    }
+  }
+  const roster = employeeRoster().filter((e) => deptFilter === "all" || e.Department === deptFilter);
+  const submittedIds = new Set(tasks.map((t) => s(t.Employee_ID)).filter(Boolean));
+  const submitted = roster.filter((e) => submittedIds.has(e.Employee_ID));
+  const notSubmitted = roster.filter((e) => !submittedIds.has(e.Employee_ID));
+  const notStarted = tasks.filter((t) => {
+    const st = s(t.Status);
+    const pct = Number(t.Progress_Percentage);
+    return st === "Not Started" || (!st && pct === 0);
+  });
+  const overdue = tasks.filter((t) => { const st = s(t.Status); return st === "Delayed" || st === "Blocked"; });
+  return { submitted, notSubmitted, notStarted, overdue, tasks, roster };
+}
+
 function computeEmployeesNeedingClarification() {
   const byEmployee = {};
   (STATE.classifiedTasks || []).forEach((t) => {
@@ -1285,6 +1314,21 @@ function renderMissingDataPanel() {
   return html;
 }
 
+function execFilterBarHtml() {
+  const deptOpts = uniqueValues(cleanRows("weeklyTasks"), "Department").map((d) => ({ value: d, label: d }));
+  const deptSelect = '<div class="filter-group"><label>Department</label><select id="execDeptFilter" class="filter-select">' +
+    '<option value="all"' + (STATE.execFilters.department === "all" ? " selected" : "") + ">All departments</option>" +
+    deptOpts.map((o) => '<option value="' + escapeHtml(o.value) + '"' + (STATE.execFilters.department === o.value ? " selected" : "") + ">" + escapeHtml(o.label) + "</option>").join("") +
+    "</select></div>";
+  const periodOpts = periodOptions();
+  const periodSelect = '<div class="filter-group"><label>Period</label><select id="execPeriodFilter" class="filter-select">' +
+    '<option value="all"' + (STATE.execFilters.period === "all" ? " selected" : "") + ">All periods</option>" +
+    periodOpts.map((o) => '<option value="' + escapeHtml(o.value) + '"' + (STATE.execFilters.period === o.value ? " selected" : "") + ">" + escapeHtml(o.label) + "</option>").join("") +
+    "</select></div>";
+  return '<div class="filter-bar">' + deptSelect + periodSelect +
+    '<button class="btn btn-ghost btn-sm" id="execFilterResetBtn">Reset filters</button></div>';
+}
+
 function renderExecutiveSummary() {
   if (!allDatasetsLoaded()) {
     return emptyStateHtml({ title: "No data loaded yet", text: "Upload your four HR datasets, or load sample data, to see organisation-wide alignment insights here.", actionHtml: '<button class="btn btn-primary" id="emptyGoUpload">Go to Upload Centre</button>' });
@@ -1299,17 +1343,32 @@ function renderExecutiveSummary() {
     });
   }
   const kpi = computeExecutiveKPIs();
-  let html = '<div class="small-caps-label" style="margin-bottom:10px">Coverage</div><div class="kpi-grid">';
+
+  // Broken-link alert: when many tasks can't link to a goal, surface a clear explanation
+  const brokenLinkCount = STATE.validation ? STATE.validation.warnings.filter((w) => w.code === "broken-link-indiv").length : 0;
+  let html = "";
+  if (brokenLinkCount > 0) {
+    const pct = kpi.totalTasks ? Math.round(brokenLinkCount / kpi.totalTasks * 100) : 0;
+    html += '<div class="card" style="border-color:var(--at-risk);margin-bottom:18px">' +
+      '<div class="card-title" style="color:var(--at-risk)">' + ICON_INFO + ' ' + brokenLinkCount + ' task' + (brokenLinkCount > 1 ? 's' : '') + ' (' + pct + '%) have a broken goal link \u2014 this reduces your Direct Alignment score</div>' +
+      '<div class="card-note" style="margin-top:6px">These tasks reference an <strong>Individual Goal ID</strong> that doesn\u2019t exist in the Individual Goals file. Until the IDs match exactly (case-sensitive), these tasks score as \u201cUnclear\u201d rather than \u201cDirectly Aligned\u201d. Open <strong>Data Validation</strong> to see which tasks are affected, then correct the <code>Linked_Individual_Goal_ID</code> column in your Weekly KPI Planner.</div>' +
+      '</div>';
+  }
+
+  // Coverage
+  html += '<div class="small-caps-label" style="margin-bottom:10px">Coverage</div><div class="kpi-grid">';
   html += kpiCardHtml({ label: "Company Goals", value: kpi.totalCompanyGoals });
   html += kpiCardHtml({ label: "Departmental Goals", value: kpi.totalDeptGoals });
   html += kpiCardHtml({ label: "Individual Goals", value: kpi.totalIndividualGoals });
   html += kpiCardHtml({ label: "Weekly Tasks Analysed", value: kpi.totalTasks });
   html += "</div>";
 
+  // Alignment breakdown
   html += '<div class="small-caps-label" style="margin-bottom:10px">Alignment Breakdown</div><div class="kpi-grid">';
   CLASSIFICATIONS.forEach((c) => { html += kpiCardHtml({ label: c, value: fmtPct(kpi.classificationPct[c]), small: true, sub: kpi.classificationCounts[c] + " tasks" }); });
   html += "</div>";
 
+  // Goal support & risk
   html += '<div class="small-caps-label" style="margin-bottom:10px">Goal Support &amp; Risk</div><div class="kpi-grid">';
   html += kpiCardHtml({ label: "Strong Support Goals", value: kpi.strongSupportGoals });
   html += kpiCardHtml({ label: "Weak Support Goals", value: kpi.weakSupportGoals, subClass: kpi.weakSupportGoals > 0 ? "accent-risk" : "", sub: kpi.weakSupportGoals > 0 ? "Needs attention" : "" });
@@ -1318,13 +1377,47 @@ function renderExecutiveSummary() {
   html += kpiCardHtml({ label: "Employees Needing Clarification", value: kpi.employeesNeedingClarification, subClass: kpi.employeesNeedingClarification > 0 ? "accent-risk" : "" });
   html += "</div>";
 
-  html += '<div class="grid-2">' +
+  // KPI compliance section (period/dept filterable)
+  const comp = computeKPICompliance(STATE.execFilters.period, STATE.execFilters.department);
+  const submissionRate = comp.roster.length ? Math.round(comp.submitted.length / comp.roster.length * 100) : 0;
+  const periodLabel = STATE.execFilters.period === "all" ? "all periods" : (STATE.execFilters.period.startsWith("month:") ? STATE.execFilters.period.slice(6) : STATE.execFilters.period.split("|").filter(Boolean).join(" \u2013 "));
+  const deptLabel = STATE.execFilters.department === "all" ? "all departments" : STATE.execFilters.department;
+
+  html += '<div class="small-caps-label" style="margin-bottom:10px">KPI Compliance</div>';
+  html += '<div class="card-note" style="margin:-4px 0 10px">Showing ' + periodLabel + ' \u00b7 ' + deptLabel + '</div>';
+  html += execFilterBarHtml();
+  html += '<div class="kpi-grid">';
+  html += kpiCardHtml({ label: "Staff Who Submitted", value: comp.submitted.length, sub: comp.roster.length + " expected \u00b7 " + submissionRate + "%" });
+  html += kpiCardHtml({ label: "Staff Who Have Not Submitted", value: comp.notSubmitted.length, subClass: comp.notSubmitted.length > 0 ? "accent-risk" : "" });
+  html += kpiCardHtml({ label: "Tasks Not Started", value: comp.notStarted.length, subClass: comp.notStarted.length > 0 ? "accent-risk" : "", sub: comp.notStarted.length > 0 ? "Progress 0% or Not Started" : "" });
+  html += kpiCardHtml({ label: "Tasks Overdue / Blocked", value: comp.overdue.length, subClass: comp.overdue.length > 0 ? "accent-risk" : "", sub: comp.overdue.length > 0 ? "Delayed or Blocked status" : "" });
+  html += "</div>";
+
+  if (comp.notSubmitted.length) {
+    html += '<div class="card-title" style="margin:14px 0 8px;font-size:13px">Staff who have not submitted' + (STATE.execFilters.period !== "all" ? " for this period" : "") + '</div>';
+    html += tableHtml([
+      { label: "Name", render: (e) => escapeHtml(e.Employee_Name) },
+      { label: "Department", render: (e) => escapeHtml(e.Department) },
+      { label: "Job Title", render: (e) => escapeHtml(e.Job_Title || "\u2014") }
+    ], comp.notSubmitted);
+  }
+
+  html += '<div class="grid-2" style="margin-top:20px">' +
     '<div class="card"><div class="card-title">Alignment Classification Breakdown</div><div class="card-note">Share of all weekly tasks in each category.</div><canvas id="donutChart" height="260"></canvas></div>' +
     '<div class="card"><div class="card-title">Average Alignment Score by Department</div><div class="card-note">Mean task score (0\u2013100) per department.</div><canvas id="deptBarChart" height="260"></canvas></div>' +
     "</div>";
 
   html += renderMissingDataPanel();
   return html;
+}
+
+function wireExecutiveSummary() {
+  const deptSel = document.getElementById("execDeptFilter");
+  const periodSel = document.getElementById("execPeriodFilter");
+  const resetBtn = document.getElementById("execFilterResetBtn");
+  if (deptSel) deptSel.addEventListener("change", (e) => { STATE.execFilters.department = e.target.value; renderSection(); });
+  if (periodSel) periodSel.addEventListener("change", (e) => { STATE.execFilters.period = e.target.value; renderSection(); });
+  if (resetBtn) resetBtn.addEventListener("click", () => { STATE.execFilters = { period: "all", department: "all" }; renderSection(); });
 }
 /* ============================== SECTION: DATA VALIDATION ============================== */
 
@@ -1354,8 +1447,22 @@ function renderDataValidation() {
   if (!v.errors.length && !v.warnings.length) { html += emptyStateHtml({ icon: ICON_CHECK_CIRCLE, title: "No issues found", text: "All four datasets passed validation cleanly." }); }
 
   if (canProceed) {
+    // Broken goal-link banner — shown prominently if many tasks can't link to a goal
+    const brokenLinks = v.warnings.filter((w) => w.code === "broken-link-indiv");
+    const blankLinks = v.warnings.filter((w) => w.code === "blank-link-indiv");
+    const totalLinkIssues = brokenLinks.length + blankLinks.length;
+    if (totalLinkIssues > 0) {
+      const pct = STATE.classifiedTasks && STATE.classifiedTasks.length ? Math.round(totalLinkIssues / STATE.classifiedTasks.length * 100) : 0;
+      html += '<div class="card" style="border-color:var(--at-risk);margin-bottom:18px">' +
+        '<div class="card-title" style="color:var(--at-risk)">' + ICON_INFO + ' Goal-link issue detected \u2014 ' + totalLinkIssues + ' task' + (totalLinkIssues > 1 ? 's' : '') + ' (' + pct + '%) cannot be Directly Aligned</div>' +
+        '<div class="card-note" style="margin-top:6px">' +
+        (brokenLinks.length ? '<strong>' + brokenLinks.length + ' broken link' + (brokenLinks.length > 1 ? 's' : '') + ':</strong> the <code>Linked_Individual_Goal_ID</code> value in your Weekly KPI Planner doesn\u2019t match any <code>Individual_Goal_ID</code> in the Individual Goals file. Check for typos, extra spaces, or case differences. ' : '') +
+        (blankLinks.length ? '<strong>' + blankLinks.length + ' blank link' + (blankLinks.length > 1 ? 's' : '') + ':</strong> these tasks have no <code>Linked_Individual_Goal_ID</code> at all. ' : '') +
+        'Until fixed, these tasks will score as \u201cUnclear due to insufficient information\u201d instead of \u201cDirectly Aligned\u201d. See the individual warnings below for the specific tasks affected.</div>' +
+        '</div>';
+    }
     html += '<div class="accept-warnings-bar"><div class="accept-warnings-text">' +
-      (v.warnings.length ? "Warnings above won't block analysis, but resolving them will improve scoring confidence." : "No blocking issues.") +
+      (v.warnings.length ? "Warnings above won\u2019t block analysis, but resolving them will improve scoring confidence." : "No blocking issues.") +
       '</div><button class="btn btn-primary" id="proceedToAnalysisBtn">' + (STATE.analysisRun ? "Re-run Analysis" : "Proceed to Analysis") + "</button></div>";
   }
   return html;
@@ -1491,10 +1598,28 @@ function renderEmployeeReports() {
     (STATE.filters.employee === "all" || e.Employee_ID === STATE.filters.employee));
   if (!roster.length) return html + emptyStateHtml({ title: "No employees match these filters", text: "Try resetting filters to see all employees." });
 
+  // Pre-compute who has submitted for the selected period (for the compliance badge)
+  const periodFilter = STATE.filters.period;
+  let periodTasks = STATE.classifiedTasks || [];
+  if (periodFilter !== "all") {
+    if (periodFilter.startsWith("month:")) {
+      const month = periodFilter.slice(6);
+      periodTasks = periodTasks.filter((t) => s(t.Month) === month);
+    } else {
+      const parts = periodFilter.split("|");
+      periodTasks = periodTasks.filter((t) => s(t.Month) === parts[0] && s(t.Week) === parts[1]);
+    }
+  }
+  const submittedIds = new Set(periodTasks.map((t) => s(t.Employee_ID)).filter(Boolean));
+
   roster.forEach((emp) => {
     const empGoals = cleanRows("individualGoals").filter((ig) => s(ig.Employee_ID) === emp.Employee_ID);
     const empTasks = applyTaskFilters((STATE.classifiedTasks || []).filter((t) => s(t.Employee_ID) === emp.Employee_ID), ["period"]);
-    html += '<div class="card" style="margin-bottom:18px"><div class="card-title">' + escapeHtml(emp.Employee_Name) + '</div><div class="card-note" style="margin-bottom:10px">' +
+    const hasSubmitted = submittedIds.has(emp.Employee_ID);
+    const complianceBadge = periodFilter !== "all"
+      ? (hasSubmitted ? '<span class="chip chip-complete" style="margin-left:8px">Submitted</span>' : '<span class="chip chip-at-risk" style="margin-left:8px">Not submitted</span>')
+      : "";
+    html += '<div class="card" style="margin-bottom:18px"><div class="card-title">' + escapeHtml(emp.Employee_Name) + complianceBadge + '</div><div class="card-note" style="margin-bottom:10px">' +
       (emp.Job_Title ? escapeHtml(emp.Job_Title) + " \u00b7 " : "") + escapeHtml(emp.Department) + "</div>";
     if (empGoals.length) {
       empGoals.forEach((ig) => {
@@ -1516,13 +1641,28 @@ function renderDepartmentReports() {
   if (STATE.filters.department !== "all") depts = depts.filter((d) => d === STATE.filters.department);
   if (!depts.length) return html + emptyStateHtml({ title: "No departments match these filters", text: "Try resetting filters to see all departments." });
 
+  // Pre-compute submission compliance per dept for the selected period
+  const comp = computeKPICompliance(STATE.filters.period, "all");
+  const submittedByDept = {};
+  comp.submitted.forEach((e) => { submittedByDept[e.Department] = (submittedByDept[e.Department] || 0) + 1; });
+  const rosterByDept = {};
+  comp.roster.forEach((e) => { rosterByDept[e.Department] = (rosterByDept[e.Department] || 0) + 1; });
+
   depts.forEach((dept) => {
     const deptGoals = cleanRows("departmentalGoals").filter((dg) => s(dg.Department) === dept &&
       (STATE.filters.companyGoal === "all" || s(dg.Linked_Company_Goal_ID) === STATE.filters.companyGoal));
     const deptTasks = applyTaskFilters((STATE.classifiedTasks || []).filter((t) => s(t.Department) === dept), ["companyGoal", "period"]);
     const rollup = STATE.departmentRollups[dept];
+    const totalStaff = rosterByDept[dept] || 0;
+    const submittedStaff = submittedByDept[dept] || 0;
+    const submissionPct = totalStaff ? Math.round(submittedStaff / totalStaff * 100) : 0;
+    const submissionText = totalStaff
+      ? submittedStaff + " of " + totalStaff + " staff submitted (" + submissionPct + "%)" + (STATE.filters.period !== "all" ? " this period" : "")
+      : "";
     html += '<div class="card" style="margin-bottom:18px"><div class="flex-between" style="margin-bottom:4px"><div class="card-title">' + escapeHtml(dept) + "</div>" + supportChipHtml(rollup.supportLevel) + "</div>" +
-      '<div class="card-note" style="margin-bottom:10px">' + rollup.taskCount + " weekly tasks \u00b7 average score " + Math.round(rollup.avgScore) + "</div>";
+      '<div class="card-note" style="margin-bottom:4px">' + rollup.taskCount + " weekly tasks \u00b7 average score " + Math.round(rollup.avgScore) + "</div>" +
+      (submissionText ? '<div class="card-note" style="margin-bottom:10px">' +
+        '<span class="' + (submissionPct < 80 ? "accent-risk" : "") + '">' + escapeHtml(submissionText) + "</span></div>" : "");
     if (deptGoals.length) {
       deptGoals.forEach((dg) => { html += goalReportBlockHtml({ title: dg.Department_Goal_Title, owner: dg.Goal_Owner, department: dept, support: STATE.departmentGoalSupport[dg.Department_Goal_ID] }); });
     } else {
@@ -2351,6 +2491,7 @@ const SECTION_RENDERERS = {
   "manage-users": renderManageUsers
 };
 const SECTION_WIRERS = {
+  "executive-summary": wireExecutiveSummary,
   "upload-centre": wireUploadCentre,
   "data-validation": wireDataValidation,
   "alignment-analysis": wireAlignmentAnalysis,
