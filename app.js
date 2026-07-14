@@ -443,6 +443,172 @@ function readDataFile(file) {
   return Promise.reject(new Error("Unsupported file type. Please upload a .csv or .xlsx file."));
 }
 
+/* ============================== RAW KPI PLANNER INGESTION ==============================
+   Accepts the KPI Planner tool's own export exactly as downloaded -- concatenated weekly
+   blocks, a title row, a header row on line 2, and block-summary rows in between -- and
+   converts it into the Weekly KPI Planner schema automatically: task rows are matched to
+   the employee's record in the already-loaded Individual Employee Goals, auto-linked to
+   the most relevant individual goal by keyword overlap, and Expected_Output/Status are
+   normalised to fields the scoring engine understands. No manual reformatting required.
+   ============================================================ */
+
+function readRawRows2D(file) {
+  const ext = file.name.split(".").pop().toLowerCase();
+  if (ext === "csv") {
+    return new Promise((resolve, reject) => {
+      Papa.parse(file, {
+        header: false, skipEmptyLines: false,
+        complete: (res) => resolve(res.data || []),
+        error: (err) => reject(err)
+      });
+    });
+  }
+  if (ext === "xlsx" || ext === "xls") {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        try {
+          const data = new Uint8Array(e.target.result);
+          const wb = XLSX.read(data, { type: "array", cellDates: true });
+          const sheet = wb.Sheets[wb.SheetNames[0]];
+          resolve(XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: null }));
+        } catch (err) { reject(err); }
+      };
+      reader.onerror = () => reject(new Error("Could not read file."));
+      reader.readAsArrayBuffer(file);
+    });
+  }
+  return Promise.reject(new Error("Unsupported file type. Please upload a .csv or .xlsx file."));
+}
+
+function looksLikeRawPlannerExport(rows2D) {
+  if (!rows2D || rows2D.length < 2) return false;
+  const header = (rows2D[1] || []).map((v) => s(v).toUpperCase());
+  return header.includes("TASK") && header.includes("CREATED BY") && !header.includes("TASK_ID");
+}
+
+function parseUKDate(v) {
+  if (!v) return null;
+  if (v instanceof Date && !isNaN(v)) return v;
+  const str = s(v);
+  const datePart = str.split(" ")[0];
+  const m = datePart.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!m) return null;
+  const d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+  return isNaN(d) ? null : d;
+}
+
+function isoWeekInfo(date) {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum = (d.getUTCDay() + 6) % 7;
+  d.setUTCDate(d.getUTCDate() - dayNum + 3);
+  const firstThursday = new Date(Date.UTC(d.getUTCFullYear(), 0, 4));
+  const week = 1 + Math.round(((d - firstThursday) / 86400000 - 3 + (firstThursday.getUTCDay() + 6) % 7) / 7);
+  const monday = new Date(date); monday.setDate(monday.getDate() - ((date.getDay() + 6) % 7));
+  const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6);
+  return { isoYear: d.getUTCFullYear(), isoWeek: week, monday, sunday };
+}
+
+const MONTH_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+function fmtDayMonth(date) { return MONTH_ABBR[date.getMonth()] + " " + String(date.getDate()).padStart(2, "0"); }
+function weekLabel(date) {
+  const { isoWeek, monday, sunday } = isoWeekInfo(date);
+  return "Week " + isoWeek + " (" + fmtDayMonth(monday) + " - " + fmtDayMonth(sunday) + ", " + date.getFullYear() + ")";
+}
+function monthLabel(date) { return MONTH_ABBR[date.getMonth()] + "-" + String(date.getFullYear()).slice(2); }
+
+function extractRawPlannerTasks(rows2D) {
+  const tasks = [];
+  for (let i = 2; i < rows2D.length; i++) {
+    const r = rows2D[i] || [];
+    const num = r[0], task = r[1];
+    const isSeparator = (num === null || num === undefined || s(num) === "") && (task === null || task === undefined || s(task) === "");
+    if (isSeparator || s(task) === "") continue;
+    tasks.push({
+      task: s(task), priority: s(r[2]),
+      startDate: parseUKDate(r[3]), endDate: parseUKDate(r[4]),
+      status: s(r[5]), createdBy: s(r[8]).replace(/\s+/g, " ").trim()
+    });
+  }
+  return tasks;
+}
+
+const RAW_PLANNER_STOPWORDS = new Set(["a","an","the","to","of","in","on","for","and","or","with","by","is","are","this","that","at","as","from","be","it","its","their","will","was","were","has","have","had","into","per","via"]);
+function rawPlannerTokenize(text) {
+  return String(text || "").toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/)
+    .filter(Boolean).filter((w) => w.length >= 3 && !RAW_PLANNER_STOPWORDS.has(w));
+}
+
+function bestIndividualGoalMatch(taskText, goalsForEmployee) {
+  const taskTokens = new Set(rawPlannerTokenize(taskText));
+  let best = null, bestOverlap = 0;
+  goalsForEmployee.forEach((g) => {
+    const goalTokens = rawPlannerTokenize((g.Individual_Goal_Title || "") + " " + (g.KPI || "") + " " + (g.Target || ""));
+    let overlap = 0;
+    goalTokens.forEach((t) => { if (taskTokens.has(t)) overlap++; });
+    if (overlap >= 2 && overlap > bestOverlap) { bestOverlap = overlap; best = g; }
+  });
+  return best;
+}
+
+function normalizeStatusForPlanner(rawStatus, endDate) {
+  const v = s(rawStatus).toLowerCase();
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const overdue = !!(endDate && endDate < today);
+  if (v === "completed") return "Completed";
+  if (v === "in progress") return overdue ? "Delayed" : "In Progress";
+  if (v === "not started") return overdue ? "Delayed" : "Not Started";
+  return overdue ? "Delayed" : (rawStatus ? s(rawStatus) : "Not Started");
+}
+
+function transformRawPlannerToWeeklyTasks(rows2D, individualGoalsDataset) {
+  const rawTasks = extractRawPlannerTasks(rows2D);
+  const byEmployee = {}; // normalized employee name -> { Employee_ID, Employee_Name, Department, goals: [] }
+  (individualGoalsDataset || []).forEach((g) => {
+    const key = s(g.Employee_Name).replace(/\s+/g, " ").trim().toUpperCase();
+    if (!key) return;
+    if (!byEmployee[key]) byEmployee[key] = { Employee_ID: s(g.Employee_ID), Employee_Name: s(g.Employee_Name), Department: s(g.Department), goals: [] };
+    byEmployee[key].goals.push(g);
+  });
+
+  const weekSeq = {};
+  const out = [];
+  const unmatchedNames = new Set();
+  rawTasks.forEach((t) => {
+    if (!t.startDate) return;
+    const key = t.createdBy.toUpperCase();
+    const person = byEmployee[key];
+    if (!person) unmatchedNames.add(t.createdBy);
+
+    const { isoWeek } = isoWeekInfo(t.startDate);
+    const seqKey = t.startDate.getFullYear() + "-W" + isoWeek;
+    weekSeq[seqKey] = (weekSeq[seqKey] || 0) + 1;
+    const taskId = "WT-" + t.startDate.getFullYear() + "-W" + isoWeek + "-" + String(weekSeq[seqKey]).padStart(4, "0");
+
+    const status = normalizeStatusForPlanner(t.status, t.endDate);
+    const match = person ? bestIndividualGoalMatch(t.task, person.goals) : null;
+
+    out.push({
+      Task_ID: taskId,
+      Week: weekLabel(t.startDate),
+      Month: monthLabel(t.startDate),
+      Employee_ID: person ? person.Employee_ID : "",
+      Employee_Name: person ? person.Employee_Name : t.createdBy,
+      Department: person ? person.Department : "",
+      Linked_Individual_Goal_ID: match ? s(match.Individual_Goal_ID) : "",
+      Planned_Task: t.task,
+      Expected_Output: "Completed / updated: " + t.task,
+      Actual_Output: status === "Completed" ? "Completed" : "",
+      Status: status,
+      Progress_Percentage: status === "Completed" ? "100" : "0",
+      Evidence: "",
+      Challenge: status === "Delayed" ? "Planner flagged this task as overdue." : "",
+      Supervisor_Comment: ""
+    });
+  });
+  return { rows: out, unmatchedNames: Array.from(unmatchedNames) };
+}
+
 function clearAnalysisState() {
   STATE.validation = null;
   STATE.validationAcknowledged = false;
@@ -461,7 +627,27 @@ function allDatasetsLoaded() {
 
 async function handleFileForSlot(slotKey, file) {
   try {
-    const rows = await readDataFile(file);
+    let rows;
+    if (slotKey === "weeklyTasks") {
+      const rows2D = await readRawRows2D(file);
+      if (looksLikeRawPlannerExport(rows2D)) {
+        if (!STATE.datasets.individualGoals || !STATE.datasets.individualGoals.length) {
+          showToast("Upload Individual Employee Goals first, then re-upload your KPI Planner export -- that's what lets tasks auto-link to the right employee.", "error");
+          return;
+        }
+        const converted = transformRawPlannerToWeeklyTasks(rows2D, STATE.datasets.individualGoals);
+        if (!converted.rows.length) { showToast("No task rows found in " + file.name, "error"); return; }
+        rows = converted.rows;
+        if (converted.unmatchedNames.length) {
+          showToast(converted.unmatchedNames.length + " name(s) in the planner didn't match an employee on file (e.g. \"" + converted.unmatchedNames[0] + "\") -- check spelling/spacing in Individual Employee Goals.", "error");
+        }
+        showToast("Raw KPI Planner export detected: " + rows.length + " tasks parsed and auto-linked automatically -- no reformatting needed.", "success");
+      } else {
+        rows = await readDataFile(file);
+      }
+    } else {
+      rows = await readDataFile(file);
+    }
     if (!rows.length) { showToast("No data rows found in " + file.name, "error"); return; }
     STATE.datasets[slotKey] = rows;
     STATE.fileMeta[slotKey] = { name: file.name, count: rows.length, source: "upload" };
