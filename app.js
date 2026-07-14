@@ -1,8 +1,11 @@
 /* ============================================================
    Performance Alignment Intelligence — for L'AINE HR
    Core application logic
-   Deterministic, rule-based engine (no external AI calls) —
-   see README.md for rationale and future upgrade path.
+   Rule-based scoring core, enhanced with client-side AI-assisted
+   semantic matching (a small on-device embedding model — no data
+   leaves the browser, no API key, no per-run cost). Falls back to
+   keyword-only matching if the model can't load. See README.md
+   for rationale and the optional LLM-based upgrade path.
    ============================================================ */
 "use strict";
 
@@ -609,6 +612,206 @@ function transformRawPlannerToWeeklyTasks(rows2D, individualGoalsDataset) {
   return { rows: out, unmatchedNames: Array.from(unmatchedNames) };
 }
 
+/* ============================== SEMANTIC MATCHING (client-side embeddings) ==============================
+   Adds paraphrase/synonym-aware matching on top of the keyword-overlap checks above. Uses a small
+   sentence-embedding model (all-MiniLM-L6-v2, ~23MB quantized) loaded on demand from a CDN via dynamic
+   import -- runs entirely in the browser, no server round-trip, no API key, no per-run cost, and no
+   data ever leaves the browser. If the model can't load (offline, blocked network), everything falls
+   back silently to the keyword-only matching already used elsewhere in this file, so nothing regresses.
+   Upgrade path: once an ANTHROPIC_API_KEY is configured as a Cloudflare Pages secret, this can be
+   swapped for LLM-judged matching on the cases embeddings are least confident about -- higher accuracy,
+   small ongoing cost. See README.md.
+   ============================================================ */
+
+const EMBED_MODEL_ID = "Xenova/all-MiniLM-L6-v2";
+const EMBED_CDN_URL = "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/+esm";
+const SEMANTIC_STRONG = 0.55;    // near-paraphrase / clearly the same intent -- auto-link, no review flag
+const SEMANTIC_MODERATE = 0.38;  // plausibly the same intent -- auto-link, flagged for human review
+
+let _embedPipelinePromise = null;
+let _embedUnavailable = false;
+const _embedVectorCache = new Map(); // normalized text -> embedding vector
+
+function getEmbedPipeline() {
+  if (_embedUnavailable) return Promise.reject(new Error("Semantic matching unavailable in this session."));
+  if (!_embedPipelinePromise) {
+    _embedPipelinePromise = import(EMBED_CDN_URL)
+      .then(({ pipeline, env }) => {
+        env.allowLocalModels = false;
+        return pipeline("feature-extraction", EMBED_MODEL_ID);
+      })
+      .catch((err) => { _embedUnavailable = true; throw err; });
+  }
+  return _embedPipelinePromise;
+}
+
+function embedCacheKey(text) { return String(text || "").trim().toLowerCase().slice(0, 800); }
+
+async function embedTexts(texts) {
+  const extractor = await getEmbedPipeline();
+  const keys = texts.map(embedCacheKey);
+  const toCompute = [];
+  const seen = new Set();
+  keys.forEach((k) => { if (k && !_embedVectorCache.has(k) && !seen.has(k)) { toCompute.push(k); seen.add(k); } });
+  if (toCompute.length) {
+    const out = await extractor(toCompute, { pooling: "mean", normalize: true });
+    const dim = out.dims[1];
+    toCompute.forEach((k, i) => { _embedVectorCache.set(k, Array.from(out.data.slice(i * dim, (i + 1) * dim))); });
+  }
+  return keys.map((k) => _embedVectorCache.get(k) || null);
+}
+
+function cosineSim(a, b) {
+  if (!a || !b) return 0;
+  let dot = 0;
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
+  return dot; // vectors are pre-normalized by the pipeline, so dot product === cosine similarity
+}
+
+/* Blended matcher: semantic cosine similarity (catches paraphrases/synonyms -- "resolve staff issues"
+   matching "improve retention") plus a small keyword-overlap nudge (rewards exact shared terminology).
+   Returns {candidate, confidence, score} on a match, {candidate:null, closest, closestScore} if nothing
+   clears the bar (kept so Data Validation can show the closest near-miss for a human to judge), or
+   {unavailable:true} if the model couldn't be reached (caller falls back to keyword-only). */
+async function semanticBestMatch(sourceText, candidates, getCandidateText) {
+  if (!candidates.length) return null;
+  const candTexts = candidates.map(getCandidateText);
+  let srcVec, candVecs;
+  try {
+    const vecs = await embedTexts([sourceText, ...candTexts]);
+    srcVec = vecs[0];
+    candVecs = vecs.slice(1);
+  } catch (err) {
+    return { unavailable: true };
+  }
+  const srcTokens = new Set(rawPlannerTokenize(sourceText));
+  let best = null;
+  candidates.forEach((c, i) => {
+    const semantic = cosineSim(srcVec, candVecs[i]);
+    const candTokens = rawPlannerTokenize(candTexts[i]);
+    let overlap = 0;
+    candTokens.forEach((t) => { if (srcTokens.has(t)) overlap++; });
+    const combined = Math.min(1, semantic + Math.min(overlap * 0.06, 0.18));
+    if (!best || combined > best.combined) best = { candidate: c, semantic, combined };
+  });
+  if (best.combined >= SEMANTIC_MODERATE) {
+    return { candidate: best.candidate, confidence: best.combined >= SEMANTIC_STRONG ? "strong" : "moderate", score: best.combined };
+  }
+  return { candidate: null, closest: best.candidate, closestScore: best.combined };
+}
+
+/* Post-load pass: for any row whose cascade link is blank, try to auto-suggest it using semantic
+   matching against the appropriate candidate set. Mutates STATE.datasets in place (only blank links --
+   an explicit value already in the uploaded file is never overwritten), tags each row it touches with
+   _autoLinked/_linkConfidence/_linkScore (or _closestCandidateId/_closestCandidateTitle/_closestScore
+   when nothing clears the bar) for transparent reporting in Data Validation, then re-runs validation
+   and re-renders. A run ID guards against a stale in-flight pass clobbering a newer upload. */
+STATE.semanticRunId = 0;
+
+async function runSemanticAutoLink() {
+  if (!allDatasetsLoaded()) return;
+  const myRunId = ++STATE.semanticRunId;
+  let touched = 0, flaggedForReview = 0, modelFailed = false;
+
+  // 1) Departmental Goals -> Company Goals
+  const companyGoals = STATE.datasets.companyGoals || [];
+  for (const row of STATE.datasets.departmentalGoals || []) {
+    if (myRunId !== STATE.semanticRunId) return;
+    if (s(row.Linked_Company_Goal_ID) || !companyGoals.length) continue;
+    const result = await semanticBestMatch(
+      (row.Department_Goal_Title || "") + ". " + (row.Goal_Description || ""),
+      companyGoals,
+      (g) => (g.Company_Goal_Title || "") + ". " + (g.Goal_Description || "")
+    );
+    if (!result) continue;
+    if (result.unavailable) { modelFailed = true; break; }
+    if (result.candidate) {
+      row.Linked_Company_Goal_ID = s(result.candidate.Company_Goal_ID);
+      row._autoLinked = true; row._linkConfidence = result.confidence; row._linkScore = result.score;
+      touched++; if (result.confidence === "moderate") flaggedForReview++;
+    } else if (result.closest) {
+      row._closestCandidateId = s(result.closest.Company_Goal_ID);
+      row._closestCandidateTitle = s(result.closest.Company_Goal_Title);
+      row._closestScore = result.closestScore;
+    }
+  }
+
+  // 2) Individual Goals -> Departmental Goals (candidates span every department -- alignment can be
+  //    cross-department, e.g. an HR-Tech-flavoured target owned by someone outside the HR Tech dept)
+  if (!modelFailed) {
+    const deptGoals = STATE.datasets.departmentalGoals || [];
+    for (const row of STATE.datasets.individualGoals || []) {
+      if (myRunId !== STATE.semanticRunId) return;
+      if (s(row.Linked_Department_Goal_ID) || !deptGoals.length) continue;
+      const result = await semanticBestMatch(
+        (row.Individual_Goal_Title || "") + ". " + (row.KPI || "") + ". " + (row.Target || ""),
+        deptGoals,
+        (g) => (g.Department_Goal_Title || "") + ". " + (g.Goal_Description || "") + ". " + (g.KPI || "")
+      );
+      if (!result) continue;
+      if (result.unavailable) { modelFailed = true; break; }
+      if (result.candidate) {
+        row.Linked_Department_Goal_ID = s(result.candidate.Department_Goal_ID);
+        row._autoLinked = true; row._linkConfidence = result.confidence; row._linkScore = result.score;
+        row._crossDepartment = !!(s(result.candidate.Department) && s(row.Department) && s(result.candidate.Department) !== s(row.Department));
+        touched++; if (result.confidence === "moderate") flaggedForReview++;
+      } else if (result.closest) {
+        row._closestCandidateId = s(result.closest.Department_Goal_ID);
+        row._closestCandidateTitle = s(result.closest.Department_Goal_Title);
+        row._closestScore = result.closestScore;
+      }
+    }
+  }
+
+  // 3) Weekly Tasks -> Individual Goals (scoped to the same employee only -- a task can only be
+  //    evidence toward that employee's own targets)
+  if (!modelFailed) {
+    const goalsByEmployee = {};
+    (STATE.datasets.individualGoals || []).forEach((g) => {
+      const key = s(g.Employee_ID);
+      if (!key) return;
+      (goalsByEmployee[key] = goalsByEmployee[key] || []).push(g);
+    });
+    for (const row of STATE.datasets.weeklyTasks || []) {
+      if (myRunId !== STATE.semanticRunId) return;
+      if (s(row.Linked_Individual_Goal_ID)) continue;
+      const myGoals = goalsByEmployee[s(row.Employee_ID)] || [];
+      if (!myGoals.length) continue;
+      const result = await semanticBestMatch(
+        (row.Planned_Task || "") + ". " + (row.Expected_Output || ""),
+        myGoals,
+        (g) => (g.Individual_Goal_Title || "") + ". " + (g.KPI || "") + ". " + (g.Target || "")
+      );
+      if (!result) continue;
+      if (result.unavailable) { modelFailed = true; break; }
+      if (result.candidate) {
+        row.Linked_Individual_Goal_ID = s(result.candidate.Individual_Goal_ID);
+        row._autoLinked = true; row._linkConfidence = result.confidence; row._linkScore = result.score;
+        touched++; if (result.confidence === "moderate") flaggedForReview++;
+      } else if (result.closest) {
+        row._closestCandidateId = s(result.closest.Individual_Goal_ID);
+        row._closestCandidateTitle = s(result.closest.Individual_Goal_Title);
+        row._closestScore = result.closestScore;
+      }
+    }
+  }
+
+  if (myRunId !== STATE.semanticRunId) return;
+  STATE.semanticMatchingAvailable = !modelFailed;
+  if (touched > 0) {
+    runValidation();
+    renderSection();
+    showToast(
+      modelFailed
+        ? "AI-assisted matching stopped partway (network/model issue) -- " + touched + " link(s) auto-suggested before that using keyword matching only."
+        : "AI-assisted matching linked " + touched + " previously-blank goal link(s)" + (flaggedForReview ? " (" + flaggedForReview + " flagged for review -- see Data Validation)" : "") + ".",
+      "success"
+    );
+  } else if (modelFailed) {
+    showToast("AI-assisted matching couldn't load this session (offline or blocked network) -- falling back to keyword-only matching.", "error");
+  }
+}
+
 function clearAnalysisState() {
   STATE.validation = null;
   STATE.validationAcknowledged = false;
@@ -658,6 +861,7 @@ async function handleFileForSlot(slotKey, file) {
     if (allDatasetsLoaded()) {
       runValidation();
       showToast("All datasets loaded. Validation is ready to review.", "success");
+      runSemanticAutoLink();
     }
   } catch (err) {
     showToast("Could not read " + file.name + ": " + err.message, "error");
@@ -675,6 +879,7 @@ function loadSampleData() {
   runValidation();
   showToast("Sample data loaded across all four datasets.", "success");
   renderSection();
+  runSemanticAutoLink();
 }
 
 function removeDatasetSlot(slotKey) {
@@ -749,6 +954,7 @@ function checkIdsAndGetExclusions(dataset, rows) {
 
 function runValidation() {
   const issues = [];
+  const suggestions = [];
   const excludedRowKeys = new Set();   // `${dataset}:${idx}`
   const columnErrorDatasets = new Set();
 
@@ -781,7 +987,11 @@ function runValidation() {
       if (link && !cleanIds.companyGoals.has(link)) {
         issues.push({ severity: "warning", dataset: "departmentalGoals", code: "broken-link-company", message: "Departmental Goal " + row.Department_Goal_ID + " links to missing Company Goal \"" + link + "\".", meta: "This goal will appear as an unresolved link in Goal Mapping and analysis." });
       } else if (!link) {
-        issues.push({ severity: "warning", dataset: "departmentalGoals", code: "blank-link-company", message: "Departmental Goal " + row.Department_Goal_ID + " has no Linked_Company_Goal_ID.", meta: "" });
+        if (row._autoLinked) {
+          suggestions.push({ severity: "suggestion", dataset: "departmentalGoals", code: "ai-link-company", message: "Departmental Goal " + row.Department_Goal_ID + " was auto-linked by AI-assisted matching (" + row._linkConfidence + " confidence, " + Math.round(row._linkScore * 100) + "% match).", meta: row._linkConfidence === "moderate" ? "Moderate confidence \u2014 please review this link." : "" });
+        } else {
+          issues.push({ severity: "warning", dataset: "departmentalGoals", code: "blank-link-company", message: "Departmental Goal " + row.Department_Goal_ID + " has no Linked_Company_Goal_ID.", meta: row._closestCandidateTitle ? "Closest match considered: \u201c" + row._closestCandidateTitle + "\u201d (" + Math.round((row._closestScore || 0) * 100) + "% similarity) \u2014 below the confidence threshold for auto-linking." : "" });
+        }
       }
     });
   }
@@ -792,7 +1002,11 @@ function runValidation() {
       if (link && !cleanIds.departmentalGoals.has(link)) {
         issues.push({ severity: "warning", dataset: "individualGoals", code: "broken-link-dept", message: "Individual Goal " + row.Individual_Goal_ID + " (" + row.Employee_Name + ") links to missing Departmental Goal \"" + link + "\".", meta: "Tasks under this goal will be classified as Unclear due to insufficient information." });
       } else if (!link) {
-        issues.push({ severity: "warning", dataset: "individualGoals", code: "blank-link-dept", message: "Individual Goal " + row.Individual_Goal_ID + " (" + row.Employee_Name + ") has no Linked_Department_Goal_ID.", meta: "" });
+        if (row._autoLinked) {
+          suggestions.push({ severity: "suggestion", dataset: "individualGoals", code: "ai-link-dept", message: "Individual Goal " + row.Individual_Goal_ID + " (" + row.Employee_Name + ") was auto-linked by AI-assisted matching (" + row._linkConfidence + " confidence, " + Math.round(row._linkScore * 100) + "% match)" + (row._crossDepartment ? " \u2014 note: matched goal belongs to a different department." : "") + ".", meta: row._linkConfidence === "moderate" ? "Moderate confidence \u2014 please review this link." : "" });
+        } else {
+          issues.push({ severity: "warning", dataset: "individualGoals", code: "blank-link-dept", message: "Individual Goal " + row.Individual_Goal_ID + " (" + row.Employee_Name + ") has no Linked_Department_Goal_ID.", meta: row._closestCandidateTitle ? "Closest match considered: \u201c" + row._closestCandidateTitle + "\u201d (" + Math.round((row._closestScore || 0) * 100) + "% similarity) \u2014 below the confidence threshold for auto-linking." : "" });
+        }
       }
     });
   }
@@ -804,7 +1018,11 @@ function runValidation() {
       if (link && !cleanIds.individualGoals.has(link)) {
         issues.push({ severity: "warning", dataset: "weeklyTasks", code: "broken-link-indiv", message: "Task " + taskRef + " (" + row.Employee_Name + ") links to missing Individual Goal \"" + link + "\".", meta: "This task will be classified as Unclear due to insufficient information." });
       } else if (!link) {
-        issues.push({ severity: "warning", dataset: "weeklyTasks", code: "blank-link-indiv", message: "Task " + taskRef + " (" + row.Employee_Name + ") has no Linked_Individual_Goal_ID.", meta: "" });
+        if (row._autoLinked) {
+          suggestions.push({ severity: "suggestion", dataset: "weeklyTasks", code: "ai-link-indiv", message: "Task " + taskRef + " (" + row.Employee_Name + ") was auto-linked by AI-assisted matching (" + row._linkConfidence + " confidence, " + Math.round(row._linkScore * 100) + "% match).", meta: row._linkConfidence === "moderate" ? "Moderate confidence \u2014 please review this link." : "" });
+        } else {
+          issues.push({ severity: "warning", dataset: "weeklyTasks", code: "blank-link-indiv", message: "Task " + taskRef + " (" + row.Employee_Name + ") has no Linked_Individual_Goal_ID.", meta: row._closestCandidateTitle ? "Closest match considered: \u201c" + row._closestCandidateTitle + "\u201d (" + Math.round((row._closestScore || 0) * 100) + "% similarity) \u2014 below the confidence threshold for auto-linking." : "" });
+        }
       }
     });
   }
@@ -846,7 +1064,7 @@ function runValidation() {
 
   const errors = issues.filter((i) => i.severity === "error");
   const warnings = issues.filter((i) => i.severity === "warning");
-  STATE.validation = { errors, warnings, excludedRowKeys, columnErrorDatasets };
+  STATE.validation = { errors, warnings, suggestions, excludedRowKeys, columnErrorDatasets };
   return STATE.validation;
 }
 
@@ -1619,9 +1837,11 @@ function renderDataValidation() {
   let html = '<div class="kpi-grid" style="margin-bottom:20px">';
   html += kpiCardHtml({ label: "Errors", value: v.errors.length, subClass: v.errors.length ? "accent-risk" : "" });
   html += kpiCardHtml({ label: "Warnings", value: v.warnings.length, subClass: v.warnings.length ? "accent-risk" : "" });
+  html += kpiCardHtml({ label: "AI-Suggested Links", value: v.suggestions.length });
   html += kpiCardHtml({ label: "Rows Excluded From Analysis", value: v.excludedRowKeys.size });
   html += kpiCardHtml({ label: "Status", value: canProceed ? "Ready" : "Blocked", subClass: canProceed ? "" : "accent-risk" });
   html += "</div>";
+  html += '<div class="card-note" style="margin:-8px 0 20px;font-size:12.5px">Goal links are matched using AI-assisted semantic matching (a small on-device model that understands paraphrasing and synonyms, not just shared keywords), with a keyword-overlap fallback if it can\u2019t load. Auto-suggested links are listed below for your review \u2014 nothing is accepted silently.</div>';
 
   if (!canProceed) {
     html += '<div class="card" style="border-color:var(--misaligned);margin-bottom:20px"><div class="card-title" style="color:var(--misaligned)">Cannot proceed to analysis yet</div><div class="card-note">The following dataset(s) are missing required columns: ' +
@@ -1630,7 +1850,8 @@ function renderDataValidation() {
 
   if (v.errors.length) { html += '<div class="small-caps-label" style="margin-bottom:10px">Errors</div>' + v.errors.map(issueRowHtml).join(""); }
   if (v.warnings.length) { html += '<div class="small-caps-label" style="margin:20px 0 10px">Warnings</div>' + v.warnings.map(issueRowHtml).join(""); }
-  if (!v.errors.length && !v.warnings.length) { html += emptyStateHtml({ icon: ICON_CHECK_CIRCLE, title: "No issues found", text: "All four datasets passed validation cleanly." }); }
+  if (v.suggestions.length) { html += '<div class="small-caps-label" style="margin:20px 0 10px">AI-Suggested Links (Review Recommended)</div>' + v.suggestions.map(issueRowHtml).join(""); }
+  if (!v.errors.length && !v.warnings.length && !v.suggestions.length) { html += emptyStateHtml({ icon: ICON_CHECK_CIRCLE, title: "No issues found", text: "All four datasets passed validation cleanly." }); }
 
   if (canProceed) {
     // Broken goal-link banner — shown prominently if many tasks can't link to a goal

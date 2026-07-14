@@ -503,9 +503,11 @@ select, input[type="text"], input[type="number"] {
 }
 .issue-row.error { background: var(--misaligned-bg); border-color: #F3CFC9; }
 .issue-row.warning { background: var(--at-risk-bg); border-color: #F3D8B6; }
+.issue-row.suggestion { background: var(--indirect-bg); border-color: #C9DCF0; }
 .issue-badge { font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 7px; border-radius: 4px; flex-shrink: 0; margin-top: 1px; }
 .issue-row.error .issue-badge { color: var(--misaligned); background: rgba(255,255,255,0.6); }
 .issue-row.warning .issue-badge { color: var(--at-risk); background: rgba(255,255,255,0.6); }
+.issue-row.suggestion .issue-badge { color: var(--indirect); background: rgba(255,255,255,0.6); }
 .issue-text strong { font-weight: 700; }
 .issue-meta { color: var(--ink-600); font-size: 11.5px; margin-top: 2px; }
 
