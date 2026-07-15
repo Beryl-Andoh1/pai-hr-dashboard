@@ -647,16 +647,22 @@ function getEmbedPipeline() {
 
 function embedCacheKey(text) { return String(text || "").trim().toLowerCase().slice(0, 800); }
 
+function yieldToBrowser() { return new Promise((resolve) => setTimeout(resolve, 0)); }
+const EMBED_BATCH_SIZE = 16; // keeps each WASM inference burst short enough that yielding between
+                              // batches actually keeps the tab responsive during a big upload
+
 async function embedTexts(texts) {
   const extractor = await getEmbedPipeline();
   const keys = texts.map(embedCacheKey);
   const toCompute = [];
   const seen = new Set();
   keys.forEach((k) => { if (k && !_embedVectorCache.has(k) && !seen.has(k)) { toCompute.push(k); seen.add(k); } });
-  if (toCompute.length) {
-    const out = await extractor(toCompute, { pooling: "mean", normalize: true });
+  for (let i = 0; i < toCompute.length; i += EMBED_BATCH_SIZE) {
+    const batch = toCompute.slice(i, i + EMBED_BATCH_SIZE);
+    const out = await extractor(batch, { pooling: "mean", normalize: true });
     const dim = out.dims[1];
-    toCompute.forEach((k, i) => { _embedVectorCache.set(k, Array.from(out.data.slice(i * dim, (i + 1) * dim))); });
+    batch.forEach((k, j) => { _embedVectorCache.set(k, Array.from(out.data.slice(j * dim, (j + 1) * dim))); });
+    await yieldToBrowser(); // hand control back to the browser (render/input) after every batch
   }
   return keys.map((k) => _embedVectorCache.get(k) || null);
 }
@@ -712,6 +718,7 @@ async function runSemanticAutoLink() {
   if (!allDatasetsLoaded()) return;
   const myRunId = ++STATE.semanticRunId;
   let touched = 0, flaggedForReview = 0, modelFailed = false;
+  showToast("Computing AI-assisted goal alignment in the background \u2014 the app stays usable while this runs.", "success");
 
   // 1) Departmental Goals -> Company Goals
   const companyGoals = STATE.datasets.companyGoals || [];
@@ -734,6 +741,7 @@ async function runSemanticAutoLink() {
       row._closestCandidateTitle = s(result.closest.Company_Goal_Title);
       row._closestScore = result.closestScore;
     }
+    await yieldToBrowser();
   }
 
   // 2) Individual Goals -> Departmental Goals (candidates span every department -- alignment can be
@@ -760,6 +768,7 @@ async function runSemanticAutoLink() {
         row._closestCandidateTitle = s(result.closest.Department_Goal_Title);
         row._closestScore = result.closestScore;
       }
+      await yieldToBrowser();
     }
   }
 
@@ -793,6 +802,7 @@ async function runSemanticAutoLink() {
         row._closestCandidateTitle = s(result.closest.Individual_Goal_Title);
         row._closestScore = result.closestScore;
       }
+      await yieldToBrowser();
     }
   }
 
