@@ -273,7 +273,7 @@ async function loadCurrentSnapshotFromServer() {
     runValidation();
     if (!STATE.validation.errors.length) {
       STATE.validationAcknowledged = true;
-      runAnalysis();
+      await runAnalysis();
     }
   } catch (err) {
     console.warn("Could not load shared snapshot from server:", err);
@@ -1087,12 +1087,43 @@ function containmentRatio(goalTokens, taskTokenSet) {
   goalTokens.forEach((t) => { if (taskTokenSet.has(t)) hits++; });
   return hits / goalTokens.size;
 }
+/* Cosine similarity is on a different scale than keyword containment (a genuinely well-matched
+   paraphrase pair rarely exceeds ~0.75, and anything under ~0.10 is noise) -- remap into the same
+   0-1 "ratio" space used by containmentRatio before blending the two signals. */
+const SEMANTIC_RELEVANCE_FLOOR = 0.10;
+const SEMANTIC_RELEVANCE_CEIL = 0.75;
+function semanticToRatio(cosine) {
+  if (cosine === null || cosine === undefined) return null;
+  return clamp01((cosine - SEMANTIC_RELEVANCE_FLOOR) / (SEMANTIC_RELEVANCE_CEIL - SEMANTIC_RELEVANCE_FLOOR));
+}
+/* Synchronous lookup into the embedding cache populated by prewarmSemanticCache() before analysis
+   runs. Returns null (not 0) on a cache miss so callers can cleanly fall back to keyword-only --
+   a null here just means the model wasn't available or this pair wasn't prewarmed, not "unrelated". */
+function getCachedCosine(textA, textB) {
+  const va = _embedVectorCache.get(embedCacheKey(textA));
+  const vb = _embedVectorCache.get(embedCacheKey(textB));
+  if (!va || !vb) return null;
+  return cosineSim(va, vb);
+}
 function computeRelevance(task, individualGoal, deptGoal, companyGoal) {
-  const taskTokens = tokenSet((task.Planned_Task || "") + " " + (task.Expected_Output || ""));
-  const primaryGoalTokens = tokenSet((individualGoal ? individualGoal.Individual_Goal_Title : "") + " " + (individualGoal ? individualGoal.KPI : ""));
-  const secondaryGoalTokens = tokenSet((deptGoal ? deptGoal.Department_Goal_Title : "") + " " + (deptGoal ? deptGoal.KPI : "") + " " + (companyGoal ? companyGoal.Company_Goal_Title : ""));
-  const primaryRatio = containmentRatio(primaryGoalTokens, taskTokens);
-  const secondaryRatio = containmentRatio(secondaryGoalTokens, taskTokens);
+  const taskText = (task.Planned_Task || "") + " " + (task.Expected_Output || "");
+  const taskTokens = tokenSet(taskText);
+  const primaryGoalText = (individualGoal ? individualGoal.Individual_Goal_Title : "") + " " + (individualGoal ? individualGoal.KPI : "");
+  const secondaryGoalText = (deptGoal ? deptGoal.Department_Goal_Title : "") + " " + (deptGoal ? deptGoal.KPI : "") + " " + (companyGoal ? companyGoal.Company_Goal_Title : "");
+  const primaryGoalTokens = tokenSet(primaryGoalText);
+  const secondaryGoalTokens = tokenSet(secondaryGoalText);
+  const primaryKeywordRatio = containmentRatio(primaryGoalTokens, taskTokens);
+  const secondaryKeywordRatio = containmentRatio(secondaryGoalTokens, taskTokens);
+
+  // Semantic similarity contributes when available (see prewarmSemanticCache) -- takes whichever
+  // signal is more confident rather than averaging, so a strong paraphrase match isn't diluted by
+  // a weak keyword overlap, and vice versa. Falls back to keyword-only on a cache miss.
+  const primarySemanticRatio = individualGoal ? semanticToRatio(getCachedCosine(taskText, primaryGoalText)) : null;
+  const secondarySemanticRatio = (deptGoal || companyGoal) ? semanticToRatio(getCachedCosine(taskText, secondaryGoalText)) : null;
+
+  const primaryRatio = primarySemanticRatio === null ? primaryKeywordRatio : Math.max(primaryKeywordRatio, primarySemanticRatio);
+  const secondaryRatio = secondarySemanticRatio === null ? secondaryKeywordRatio : Math.max(secondaryKeywordRatio, secondarySemanticRatio);
+
   const combined = clamp01(primaryRatio * 0.7 + secondaryRatio * 0.3);
   return Math.round(combined * 25);
 }
@@ -1199,7 +1230,37 @@ function cleanRows(dataset) {
   return rows.filter((row, idx) => !excluded.has(dataset + ":" + idx));
 }
 
-function runAnalysis() {
+/* One batched embedding pass over every unique task/goal text that classifyTask will need, run
+   once before the (synchronous) per-task scoring loop below -- this is what lets computeRelevance
+   pull semantic similarity via a plain synchronous cache lookup (getCachedCosine) instead of
+   needing to make the whole scoring loop async. Cheap on a re-run: embedTexts only computes
+   embeddings for text it hasn't already cached. Falls back silently (keyword-only relevance) if
+   the model can't load. */
+async function prewarmSemanticCache(weeklyTasks, individualGoalsById, departmentGoalsById, companyGoalsById) {
+  const texts = new Set();
+  weeklyTasks.forEach((task) => {
+    const taskText = (task.Planned_Task || "") + " " + (task.Expected_Output || "");
+    if (!taskText.trim()) return;
+    texts.add(taskText);
+    const individualGoal = individualGoalsById[s(task.Linked_Individual_Goal_ID)];
+    if (!individualGoal) return;
+    texts.add((individualGoal.Individual_Goal_Title || "") + " " + (individualGoal.KPI || ""));
+    const deptGoal = departmentGoalsById[s(individualGoal.Linked_Department_Goal_ID)];
+    if (!deptGoal) return;
+    const companyGoal = companyGoalsById[s(deptGoal.Linked_Company_Goal_ID)];
+    texts.add((deptGoal.Department_Goal_Title || "") + " " + (deptGoal.KPI || "") + " " + (companyGoal ? companyGoal.Company_Goal_Title : ""));
+  });
+  const list = Array.from(texts).filter((t) => t && t.trim());
+  if (!list.length) return true;
+  try {
+    await embedTexts(list);
+    return true;
+  } catch (err) {
+    return false; // computeRelevance sees cache misses and falls back to keyword-only -- no crash
+  }
+}
+
+async function runAnalysis() {
   const companyGoals = cleanRows("companyGoals");
   const departmentalGoals = cleanRows("departmentalGoals");
   const individualGoals = cleanRows("individualGoals");
@@ -1209,6 +1270,9 @@ function runAnalysis() {
   const departmentGoalsById = byIdMap(departmentalGoals, "Department_Goal_ID");
   const individualGoalsById = byIdMap(individualGoals, "Individual_Goal_ID");
   const ctx = { companyGoalsById, departmentGoalsById, individualGoalsById };
+
+  const semanticReady = await prewarmSemanticCache(weeklyTasks, individualGoalsById, departmentGoalsById, companyGoalsById);
+  STATE.semanticMatchingAvailable = semanticReady;
 
   const classifiedTasks = weeklyTasks.map((task) => {
     const score = classifyTask(task, ctx);
@@ -1879,8 +1943,13 @@ function wireDataValidation() {
   const btn = document.getElementById("proceedToAnalysisBtn");
   if (btn) btn.addEventListener("click", async () => {
     STATE.validationAcknowledged = true;
-    runAnalysis();
-    showToast("Analysis complete. " + STATE.classifiedTasks.length + " tasks classified.", "success");
+    btn.disabled = true;
+    const originalLabel = btn.textContent;
+    btn.textContent = "Running AI-assisted analysis\u2026";
+    await runAnalysis();
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+    showToast("Analysis complete. " + STATE.classifiedTasks.length + " tasks classified." + (STATE.semanticMatchingAvailable === false ? " (AI-assisted matching unavailable this session -- used keyword-only scoring.)" : ""), "success");
     navigateTo("executive-summary");
     await pushSnapshotToServer();
   });
@@ -2929,7 +2998,7 @@ function renderSection() {
 
   const goUpload = document.getElementById("emptyGoUpload"); if (goUpload) goUpload.addEventListener("click", () => navigateTo("upload-centre"));
   const goValidation = document.getElementById("emptyGoValidation"); if (goValidation) goValidation.addEventListener("click", () => navigateTo("data-validation"));
-  const runAnalysisBtn = document.getElementById("emptyRunAnalysis"); if (runAnalysisBtn) runAnalysisBtn.addEventListener("click", () => { runAnalysis(); renderSection(); });
+  const runAnalysisBtn = document.getElementById("emptyRunAnalysis"); if (runAnalysisBtn) runAnalysisBtn.addEventListener("click", async () => { await runAnalysis(); renderSection(); });
 
   document.querySelectorAll(".nav-item").forEach((btn) => { btn.classList.toggle("active", btn.getAttribute("data-section") === STATE.currentSection); });
 
