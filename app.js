@@ -561,6 +561,12 @@ function normalizeStatusForPlanner(rawStatus, endDate) {
   if (v === "completed") return "Completed";
   if (v === "in progress") return overdue ? "Delayed" : "In Progress";
   if (v === "not started") return overdue ? "Delayed" : "Not Started";
+  if (v === "on track") return overdue ? "Delayed" : "On Track";
+  if (v === "blocked" || v === "stuck" || v === "on hold") return "Blocked";
+  // The KPI Planner tool itself uses "Overdue" as a native status value (distinct from the
+  // date-computed `overdue` check above) -- previously this fell through unrecognised and scored
+  // a flat 5 points instead of being treated the same as any other date-computed overdue task.
+  if (v === "overdue") return "Delayed";
   return overdue ? "Delayed" : (rawStatus ? s(rawStatus) : "Not Started");
 }
 
