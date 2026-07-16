@@ -14,8 +14,8 @@
 const REQUIRED_FIELDS = {
   companyGoals: ["Company_Goal_ID","Company_Goal_Title","Strategic_Pillar","Goal_Description","Success_Measure","Target","Timeline","Priority","Goal_Owner"],
   departmentalGoals: ["Department_Goal_ID","Linked_Company_Goal_ID","Department","Department_Goal_Title","Goal_Description","KPI","Target","Timeline","Goal_Owner"],
-  individualGoals: ["Individual_Goal_ID","Linked_Department_Goal_ID","Employee_ID","Employee_Name","Department","Job_Title","Individual_Goal_Title","KPI","Target","Timeline","Weight"],
-  weeklyTasks: ["Task_ID","Week","Month","Employee_ID","Employee_Name","Department","Linked_Individual_Goal_ID","Planned_Task","Expected_Output","Actual_Output","Status","Progress_Percentage","Evidence","Challenge","Supervisor_Comment"]
+  individualGoals: ["Individual_Goal_ID","Linked_Department_Goal_ID","Employee_ID","Employee_Name","Department","Job_Title","Individual_Goal_Title","KPI","Target","Timeline"],
+  weeklyTasks: ["Task_ID","Week","Month","Employee_ID","Employee_Name","Department","Linked_Individual_Goal_ID","Planned_Task","Expected_Output","Actual_Output","Status","Progress_Percentage","Challenge","Supervisor_Comment"]
 };
 
 const ID_FIELD = { companyGoals: "Company_Goal_ID", departmentalGoals: "Department_Goal_ID", individualGoals: "Individual_Goal_ID", weeklyTasks: "Task_ID" };
@@ -38,7 +38,7 @@ const CHIP_CLASS_BY_CLASSIFICATION = {
   "Unclear due to insufficient information": "chip-unclear"
 };
 
-const STATUS_POINTS = { "Completed": 10, "On Track": 8, "In Progress": 6, "Delayed": 3, "Blocked": 1, "Not Started": 0 };
+const STATUS_POINTS = { "Completed": 25, "On Track": 20, "In Progress": 15, "Delayed": 8, "Blocked": 3, "Not Started": 0 };
 const STATUS_CHIP_CLASS = { "Completed": "chip-complete", "On Track": "chip-direct", "In Progress": "chip-indirect", "Delayed": "chip-at-risk", "Blocked": "chip-misaligned", "Not Started": "chip-neutral" };
 
 const STEPS = ["Upload", "Validate", "Analyse", "Report", "Export"];
@@ -1051,7 +1051,6 @@ function runValidation() {
       if (isBlank(row.Planned_Task)) issues.push({ severity: "warning", dataset: "weeklyTasks", code: "blank-task", message: "Task " + taskRef + " (" + row.Employee_Name + ") has a blank task description.", meta: "Cannot be scored for relevance; will be classified as Unclear due to insufficient information." });
       if (isBlank(row.Expected_Output)) issues.push({ severity: "warning", dataset: "weeklyTasks", code: "missing-output", message: "Task " + taskRef + " (" + row.Employee_Name + ") is missing an expected output.", meta: "Reduces the measurability component of the alignment score." });
       if (isBlank(row.Status)) issues.push({ severity: "warning", dataset: "weeklyTasks", code: "missing-status", message: "Task " + taskRef + " (" + row.Employee_Name + ") is missing a status.", meta: "Reduces the progress component of the alignment score." });
-      if (isBlank(row.Evidence)) issues.push({ severity: "warning", dataset: "weeklyTasks", code: "missing-evidence", message: "Task " + taskRef + " (" + row.Employee_Name + ") has no evidence attached.", meta: "Reduces the evidence component of the alignment score." });
       const pctRaw = s(row.Progress_Percentage);
       if (pctRaw !== "") {
         const pct = Number(pctRaw);
@@ -1141,7 +1140,7 @@ function computeRelevance(task, individualGoal, deptGoal, companyGoal) {
   const secondaryRatio = secondarySemanticRatio === null ? secondaryKeywordRatio : Math.max(secondaryKeywordRatio, secondarySemanticRatio);
 
   const combined = clamp01(primaryRatio * 0.7 + secondaryRatio * 0.3);
-  return Math.round(combined * 25);
+  return Math.round(combined * 35);
 }
 
 /* ============================== CLASSIFICATION ENGINE ============================== */
@@ -1166,24 +1165,24 @@ function classifyTask(task, ctx) {
 
   const relevancePoints = computeRelevance(task, individualGoal, deptGoal, companyGoal);
 
+  // Measurability and Evidence used to be scored separately, but Evidence rewarded documentation
+  // effort (attaching a note/file) rather than actual goal contribution -- easy to game, tedious to
+  // collect, and orthogonal to the question this app exists to answer: is the work itself moving the
+  // goal forward? Evidence is no longer scored. Its weight is folded into Measurability (did the task
+  // define a clear, checkable output) and Progress (did the work actually get done).
   const expectedOutput = s(task.Expected_Output);
-  const measurabilityPoints = !expectedOutput ? 0 : (expectedOutput.length < 12 ? 12 : 20);
-
-  const evidence = s(task.Evidence);
-  const actualOutput = s(task.Actual_Output);
-  const evidenceCount = (evidence ? 1 : 0) + (actualOutput ? 1 : 0);
-  const evidencePoints = evidenceCount === 2 ? 20 : evidenceCount === 1 ? 10 : 0;
+  const measurabilityPoints = !expectedOutput ? 0 : (expectedOutput.length < 12 ? 8 : 15);
 
   const statusRaw = s(task.Status);
   let progressPoints;
   if (!statusRaw) progressPoints = 0;
   else if (statusRaw in STATUS_POINTS) progressPoints = STATUS_POINTS[statusRaw];
-  else progressPoints = 5;
+  else progressPoints = 12;
 
-  const total = linkagePoints + relevancePoints + measurabilityPoints + evidencePoints + progressPoints;
+  const total = linkagePoints + relevancePoints + measurabilityPoints + progressPoints;
 
   const plannedTask = s(task.Planned_Task);
-  const criticalMissing = !plannedTask || (!expectedOutput && !evidence && !statusRaw);
+  const criticalMissing = !plannedTask || (!expectedOutput && !statusRaw);
 
   let classification, reasonTag;
   if (criticalMissing) {
@@ -1193,22 +1192,29 @@ function classifyTask(task, ctx) {
     classification = "Unclear due to insufficient information";
     reasonTag = !individualGoal ? "goal-not-found" : "broken-chain";
   } else {
-    const relevanceRatio = relevancePoints / 25;
-    const executionScore = measurabilityPoints + evidencePoints + progressPoints; // 0-50
+    const relevanceRatio = relevancePoints / 35;
+    const executionScore = measurabilityPoints + progressPoints; // 0-40 -- did the task get defined and done
     if (relevanceRatio > 0) {
       if (total >= 80) { classification = "Directly aligned"; reasonTag = "strong-score"; }
       else if (total >= 55) { classification = "Indirectly aligned"; reasonTag = "moderate-score"; }
-      else if (executionScore >= 25) { classification = "Routine/Business-as-usual"; reasonTag = "low-relevance-ok-execution"; }
+      else if (executionScore >= 20) { classification = "Routine/Business-as-usual"; reasonTag = "low-relevance-ok-execution"; }
       else { classification = "Misaligned"; reasonTag = "low-score"; }
     } else {
-      if (executionScore >= 30) { classification = "Routine/Business-as-usual"; reasonTag = "no-relevance-ok-execution"; }
+      if (executionScore >= 24) { classification = "Routine/Business-as-usual"; reasonTag = "no-relevance-ok-execution"; }
       else { classification = "Misaligned"; reasonTag = "no-relevance-poor-execution"; }
     }
   }
 
+  // Split view for reporting: Alignment (is the work pointed at the right goal?) vs Execution
+  // (did the task get clearly defined and actually done?) -- kept separate so a well-aligned but
+  // undone task, and a busy-but-unrelated task, don't get flattened into the same-looking number.
+  const alignmentPct = clamp01((linkagePoints + relevancePoints) / 60) * 100; // max 25 + 35
+  const executionPct = clamp01((measurabilityPoints + progressPoints) / 40) * 100; // max 15 + 25
+
   return {
     individualGoal, deptGoal, companyGoal,
-    linkagePoints, linkageValid, relevancePoints, measurabilityPoints, evidencePoints, progressPoints,
+    linkagePoints, linkageValid, relevancePoints, measurabilityPoints, progressPoints,
+    alignmentPct: Math.round(alignmentPct), executionPct: Math.round(executionPct),
     total, classification, reasonTag
   };
 }
@@ -1218,6 +1224,8 @@ function classifyTask(task, ctx) {
 function summarizeTasks(tasks) {
   const taskCount = tasks.length;
   const avgScore = avg(tasks.map((t) => t._score.total));
+  const avgAlignmentPct = avg(tasks.map((t) => t._score.alignmentPct));
+  const avgExecutionPct = avg(tasks.map((t) => t._score.executionPct));
   const byClass = {};
   CLASSIFICATIONS.forEach((c) => { byClass[c] = 0; });
   tasks.forEach((t) => { byClass[t._score.classification] = (byClass[t._score.classification] || 0) + 1; });
@@ -1228,15 +1236,42 @@ function summarizeTasks(tasks) {
   else if (avgScore >= 65 && strongRatio >= 0.5) supportLevel = "Strong Support";
   else supportLevel = "Weak Support";
   const challengeCount = tasks.filter((t) => !isBlank(t.Challenge)).length;
-  const evidenceMissingCount = tasks.filter((t) => isBlank(t.Evidence)).length;
-  const atRisk = supportLevel !== "Strong Support" || challengeCount >= 2 || (taskCount > 0 && evidenceMissingCount / taskCount > 0.4);
+  const atRisk = supportLevel !== "Strong Support" || challengeCount >= 2;
   const riskReasons = [];
   if (supportLevel === "No Activity Support") riskReasons.push("No weekly tasks logged against this goal");
   if (supportLevel === "Weak Support") riskReasons.push("Linked tasks show low alignment scores or limited direct contribution");
   if (challengeCount >= 2) riskReasons.push(challengeCount + " linked tasks reported a challenge or blocker");
-  if (taskCount > 0 && evidenceMissingCount / taskCount > 0.4) riskReasons.push("Over 40% of linked tasks have no evidence attached");
-  return { taskCount, avgScore, byClass, strongCount, strongRatio, supportLevel, challengeCount, evidenceMissingCount, atRisk, riskReasons };
+  return { taskCount, avgScore, avgAlignmentPct, avgExecutionPct, byClass, strongCount, strongRatio, supportLevel, challengeCount, atRisk, riskReasons };
 }
+
+/* ============================== CADENCE / CONSISTENCY TRACKING ==============================
+   Alignment scoring answers "is this task pointed at the right goal?" Cadence answers a different
+   question the user asked for explicitly: "is this person showing up and doing the work every
+   period, or drifting in and out?" It's computed independently of task content or quality -- purely
+   from how many distinct weeks (out of every week represented anywhere in the uploaded Weekly KPI
+   Planner) an employee has at least one logged task in. A high scorer who only logs once a month is
+   still a consistency risk even if every task they do log is perfectly aligned. */
+const CADENCE_CONSISTENT_RATIO = 0.8;
+const CADENCE_INCONSISTENT_RATIO = 0.5;
+const CADENCE_TIERS = ["Consistent", "Inconsistent", "Sporadic", "Not Logging"];
+const CADENCE_CHIP_CLASS = { "Consistent": "chip-complete", "Inconsistent": "chip-indirect", "Sporadic": "chip-at-risk", "Not Logging": "chip-misaligned" };
+const CADENCE_TIER_TEXT = {
+  "Consistent": "Logging tasks in most weeks of the reporting period.",
+  "Inconsistent": "Logging tasks in some weeks, but with real gaps.",
+  "Sporadic": "Logging tasks in only a small fraction of weeks.",
+  "Not Logging": "No weekly tasks logged in this period at all."
+};
+function computeCadence(tasks, totalWeeks) {
+  const weeksActive = new Set(tasks.map((t) => s(t.Week)).filter(Boolean)).size;
+  const ratio = totalWeeks ? weeksActive / totalWeeks : 0;
+  let tier;
+  if (weeksActive === 0) tier = "Not Logging";
+  else if (ratio >= CADENCE_CONSISTENT_RATIO) tier = "Consistent";
+  else if (ratio >= CADENCE_INCONSISTENT_RATIO) tier = "Inconsistent";
+  else tier = "Sporadic";
+  return { weeksActive, totalWeeks, ratio, tier };
+}
+function cadenceChipHtml(tier) { return chipHtml(tier, CADENCE_CHIP_CLASS[tier] || "chip-neutral"); }
 
 /* ============================== ANALYSIS ORCHESTRATOR ============================== */
 
@@ -1375,19 +1410,33 @@ async function runAnalysis() {
   hierarchy.orphanIndividualGoals = orphanIndividualGoals;
   hierarchy.orphanTasks = orphanTasks;
 
+  // Cadence: every distinct Week value anywhere in the uploaded planner defines the reporting
+  // period; each employee's cadence is how many of those weeks they logged at least one task in.
+  const allWeeksInPeriod = uniqueValues(weeklyTasks, "Week").filter(Boolean);
+  const cadenceEmployeeIds = new Set();
+  individualGoals.forEach((ig) => { if (s(ig.Employee_ID)) cadenceEmployeeIds.add(s(ig.Employee_ID)); });
+  classifiedTasks.forEach((t) => { if (s(t.Employee_ID)) cadenceEmployeeIds.add(s(t.Employee_ID)); });
+  const employeeCadence = {};
+  cadenceEmployeeIds.forEach((empId) => {
+    const empTasks = classifiedTasks.filter((t) => s(t.Employee_ID) === empId);
+    employeeCadence[empId] = computeCadence(empTasks, allWeeksInPeriod.length);
+  });
+
   STATE.classifiedTasks = classifiedTasks;
   STATE.individualGoalSupport = individualGoalSupport;
   STATE.departmentGoalSupport = departmentGoalSupport;
   STATE.companyGoalSupport = companyGoalSupport;
   STATE.departmentRollups = departmentRollups;
   STATE.hierarchy = hierarchy;
+  STATE.employeeCadence = employeeCadence;
+  STATE.totalWeeksInPeriod = allWeeksInPeriod.length;
   STATE.analysisRun = true;
 }
 /* ============================== REASON TEXT & RECOMMENDATIONS ============================== */
 
 const REASON_TAG_TEXT = {
   "missing-task": "No task description was provided.",
-  "missing-core-fields": "Expected output, evidence, and status were all left blank.",
+  "missing-core-fields": "Expected output and status were both left blank.",
   "goal-not-found": "The linked Individual Goal ID does not exist in the goals dataset.",
   "broken-chain": "The goal chain is incomplete above the individual goal (missing department or company goal link).",
   "strong-score": "Strong linkage, relevance, and execution.",
@@ -1543,6 +1592,21 @@ function employeeRoster() {
     if (id && !byId[id]) byId[id] = { Employee_ID: id, Employee_Name: t.Employee_Name, Department: t.Department, Job_Title: "" };
   });
   return Object.values(byId).sort((a, b) => a.Employee_Name.localeCompare(b.Employee_Name));
+}
+
+// Cadence distribution across the roster, for the org-wide Executive Summary card and the
+// follow-up list of people who are drifting out of a regular logging rhythm.
+function computeCadenceDistribution(deptFilter) {
+  const roster = employeeRoster().filter((e) => !deptFilter || deptFilter === "all" || e.Department === deptFilter);
+  const counts = {}; CADENCE_TIERS.forEach((t) => { counts[t] = 0; });
+  const atRiskEmployees = [];
+  roster.forEach((e) => {
+    const cad = (STATE.employeeCadence || {})[e.Employee_ID] || { weeksActive: 0, totalWeeks: STATE.totalWeeksInPeriod || 0, ratio: 0, tier: "Not Logging" };
+    counts[cad.tier] = (counts[cad.tier] || 0) + 1;
+    if (cad.tier === "Sporadic" || cad.tier === "Not Logging") atRiskEmployees.push(Object.assign({}, e, { cadence: cad }));
+  });
+  atRiskEmployees.sort((a, b) => a.cadence.ratio - b.cadence.ratio);
+  return { total: roster.length, counts, atRiskEmployees };
 }
 /* ============================== SHARED UI BUILDERS ============================== */
 
@@ -1886,6 +1950,28 @@ function renderExecutiveSummary() {
     ], comp.notSubmitted);
   }
 
+  // Cadence & consistency: are people showing up and logging work every week across the whole
+  // reporting period, or only occasionally? Independent of the period/dept filters above -- this
+  // looks at the full span of weeks in the uploaded planner, not just the currently selected one.
+  const cadenceDist = computeCadenceDistribution(STATE.execFilters.department);
+  html += '<div class="small-caps-label" style="margin:20px 0 10px">Task Cadence &amp; Consistency</div>';
+  html += '<div class="card-note" style="margin:-4px 0 10px">Across all ' + (STATE.totalWeeksInPeriod || 0) + ' week(s) represented in the Weekly KPI Planner \u2014 not just the selected period. Measures whether people are logging work regularly, separately from whether that work is aligned.</div>';
+  html += '<div class="kpi-grid">';
+  html += kpiCardHtml({ label: "Consistent", value: cadenceDist.counts["Consistent"], sub: "\u226580% of weeks logged" });
+  html += kpiCardHtml({ label: "Inconsistent", value: cadenceDist.counts["Inconsistent"], subClass: cadenceDist.counts["Inconsistent"] > 0 ? "accent-risk" : "", sub: "50\u201379% of weeks logged" });
+  html += kpiCardHtml({ label: "Sporadic", value: cadenceDist.counts["Sporadic"], subClass: cadenceDist.counts["Sporadic"] > 0 ? "accent-risk" : "", sub: "Under 50% of weeks logged" });
+  html += kpiCardHtml({ label: "Not Logging", value: cadenceDist.counts["Not Logging"], subClass: cadenceDist.counts["Not Logging"] > 0 ? "accent-risk" : "", sub: "No weekly tasks on record" });
+  html += "</div>";
+  if (cadenceDist.atRiskEmployees.length) {
+    html += '<div class="card-title" style="margin:14px 0 8px;font-size:13px">Drifting out of a regular logging rhythm</div>';
+    html += tableHtml([
+      { label: "Name", render: (e) => escapeHtml(e.Employee_Name) },
+      { label: "Department", render: (e) => escapeHtml(e.Department) },
+      { label: "Weeks Active", render: (e) => e.cadence.weeksActive + " of " + e.cadence.totalWeeks },
+      { label: "Cadence", render: (e) => cadenceChipHtml(e.cadence.tier) }
+    ], cadenceDist.atRiskEmployees);
+  }
+
   html += '<div class="grid-2" style="margin-top:20px">' +
     '<div class="card"><div class="card-title">Alignment Classification Breakdown</div><div class="card-note">Share of all weekly tasks in each category.</div><canvas id="donutChart" height="260"></canvas></div>' +
     '<div class="card"><div class="card-title">Average Alignment Score by Department</div><div class="card-note">Mean task score (0\u2013100) per department.</div><canvas id="deptBarChart" height="260"></canvas></div>' +
@@ -1993,7 +2079,8 @@ function taskMiniTableHtml(tasks) {
     { key: "Task_ID", label: "Task" },
     { label: "Planned Task", render: (t) => escapeHtml(t.Planned_Task || "\u2014") },
     { label: "Classification", render: (t) => classificationChip(t._score.classification) },
-    { label: "Score", render: (t) => '<div style="display:flex;align-items:center;gap:8px"><span>' + t._score.total + "</span>" + scoreBarHtml(t._score.total) + "</div>" }
+    { label: "Alignment", render: (t) => t._score.alignmentPct + "%" },
+    { label: "Execution", render: (t) => t._score.executionPct + "%" }
   ], tasks);
 }
 
@@ -2053,7 +2140,8 @@ function alignmentTableHtml(tasks) {
     { label: "Department", render: (t) => escapeHtml(t.Department) },
     { label: "Planned Task", render: (t) => escapeHtml(t.Planned_Task || "\u2014") },
     { label: "Classification", render: (t) => classificationChip(t._score.classification) },
-    { label: "Score", render: (t) => '<div style="display:flex;align-items:center;gap:8px;min-width:110px"><span>' + t._score.total + "</span>" + scoreBarHtml(t._score.total) + "</div>" },
+    { label: "Alignment", render: (t) => '<div style="display:flex;align-items:center;gap:8px;min-width:90px"><span>' + t._score.alignmentPct + "%</span>" + scoreBarHtml(t._score.alignmentPct) + "</div>" },
+    { label: "Execution", render: (t) => '<div style="display:flex;align-items:center;gap:8px;min-width:90px"><span>' + t._score.executionPct + "%</span>" + scoreBarHtml(t._score.executionPct) + "</div>" },
     { label: "Status", render: (t) => statusChipHtml(t.Status) },
     { label: "Linked Goal", render: (t) => escapeHtml(t._score.individualGoal ? t._score.individualGoal.Individual_Goal_Title : "\u2014") }
   ], tasks);
@@ -2074,7 +2162,10 @@ function wireAlignmentAnalysis() { wireFilterBar(() => renderSection()); }
 /* ============================== SECTION: EMPLOYEE / DEPARTMENT / ORGANISATIONAL REPORTS ============================== */
 
 function goalReportBlockHtml(record, showLevel, workflowHtml) {
-  const scoreHtml = '<div style="display:flex;align-items:center;gap:10px;min-width:170px"><span class="kpi-value small">' + Math.round(record.support.avgScore || 0) + "</span>" + scoreBarHtml(record.support.avgScore) + supportChipHtml(record.support.supportLevel) + "</div>";
+  const scoreHtml = '<div style="display:flex;align-items:center;gap:14px;min-width:230px;flex-wrap:wrap">' +
+    '<div style="display:flex;align-items:center;gap:6px" title="Are linked tasks pointed at the right goal? (linkage + relevance)"><span class="kpi-sub">Align</span><span class="kpi-value small">' + Math.round(record.support.avgAlignmentPct || 0) + "%</span>" + scoreBarHtml(record.support.avgAlignmentPct || 0) + "</div>" +
+    '<div style="display:flex;align-items:center;gap:6px" title="Is the work actually getting defined and done? (measurability + progress)"><span class="kpi-sub">Exec</span><span class="kpi-value small">' + Math.round(record.support.avgExecutionPct || 0) + "%</span>" + scoreBarHtml(record.support.avgExecutionPct || 0) + "</div>" +
+    supportChipHtml(record.support.supportLevel) + "</div>";
   const body = '<div class="card-note" style="margin:4px 0 10px">' + record.support.taskCount + (record.support.taskCount === 1 ? " linked task" : " linked tasks") +
     " \u00b7 owner: " + escapeHtml(record.owner || "\u2014") + (record.department ? " \u00b7 " + escapeHtml(record.department) : "") + "</div>";
   const recommend = generateGoalRecommendation(record.support, record.title, record.owner);
@@ -2111,8 +2202,11 @@ function renderEmployeeReports() {
     const complianceBadge = periodFilter !== "all"
       ? (hasSubmitted ? '<span class="chip chip-complete" style="margin-left:8px">Submitted</span>' : '<span class="chip chip-at-risk" style="margin-left:8px">Not submitted</span>')
       : "";
-    html += '<div class="card" style="margin-bottom:18px"><div class="card-title">' + escapeHtml(emp.Employee_Name) + complianceBadge + '</div><div class="card-note" style="margin-bottom:10px">' +
-      (emp.Job_Title ? escapeHtml(emp.Job_Title) + " \u00b7 " : "") + escapeHtml(emp.Department) + "</div>";
+    const cadence = (STATE.employeeCadence || {})[emp.Employee_ID];
+    const cadenceBadge = cadence ? '<span style="margin-left:8px">' + cadenceChipHtml(cadence.tier) + '</span>' : "";
+    html += '<div class="card" style="margin-bottom:18px"><div class="card-title">' + escapeHtml(emp.Employee_Name) + complianceBadge + cadenceBadge + '</div><div class="card-note" style="margin-bottom:10px">' +
+      (emp.Job_Title ? escapeHtml(emp.Job_Title) + " \u00b7 " : "") + escapeHtml(emp.Department) +
+      (cadence ? " \u00b7 Active " + cadence.weeksActive + " of " + cadence.totalWeeks + " weeks logged \u2014 " + CADENCE_TIER_TEXT[cadence.tier] : "") + "</div>";
     if (empGoals.length) {
       empGoals.forEach((ig) => {
         html += goalReportBlockHtml({ title: ig.Individual_Goal_Title, owner: emp.Employee_Name, department: emp.Department, support: STATE.individualGoalSupport[ig.Individual_Goal_ID] });
@@ -2767,7 +2861,7 @@ function exportExcel() {
       Task_ID: t.Task_ID, Week: t.Week, Month: t.Month, Employee_ID: t.Employee_ID, Employee_Name: t.Employee_Name, Department: t.Department,
       Linked_Individual_Goal_ID: t.Linked_Individual_Goal_ID, Planned_Task: t.Planned_Task, Expected_Output: t.Expected_Output, Actual_Output: t.Actual_Output,
       Status: t.Status, Progress_Percentage: t.Progress_Percentage, Evidence: t.Evidence, Challenge: t.Challenge, Supervisor_Comment: t.Supervisor_Comment,
-      Linkage_Points: t._score.linkagePoints, Relevance_Points: t._score.relevancePoints, Measurability_Points: t._score.measurabilityPoints, Evidence_Points: t._score.evidencePoints, Progress_Points: t._score.progressPoints,
+      Linkage_Points: t._score.linkagePoints, Relevance_Points: t._score.relevancePoints, Measurability_Points: t._score.measurabilityPoints, Progress_Points: t._score.progressPoints,
       Total_Score: t._score.total, Classification: t._score.classification, Reason_Tag: t._score.reasonTag
     }));
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rawRows), "Raw Task Classification");
